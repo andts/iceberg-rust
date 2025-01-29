@@ -282,7 +282,7 @@
 </span><span class="attr">#[derive(Debug, Clone)]
 </span><span class="kw">pub struct </span>IcebergTableProvider {
     <span class="doccomment">/// A table in the catalog.
-    </span>table: Table,
+    </span><span class="kw">pub </span>table: Table,
     <span class="doccomment">/// Table snapshot id that will be queried via this provider.
     </span>snapshot_id: <span class="prelude-ty">Option</span>&lt;i64&gt;,
     <span class="doccomment">/// A reference-counted arrow `Schema`.
@@ -300,7 +300,7 @@
     <span class="doccomment">/// Asynchronously tries to construct a new [`IcebergTableProvider`]
     /// using the given client and table name to fetch an actual [`Table`]
     /// in the provided namespace.
-    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">async fn </span>try_new(
+    </span><span class="kw">pub async fn </span>try_new(
         client: Arc&lt;<span class="kw">dyn </span>Catalog&gt;,
         namespace: NamespaceIdent,
         name: <span class="kw">impl </span>Into&lt;String&gt;,
