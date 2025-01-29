@@ -46,7 +46,7 @@ use crate::writer::CurrentFileStatus;
 use crate::{Error, ErrorKind, Result};
 
 /// ParquetWriterBuilder is used to builder a [`ParquetWriter`]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ParquetWriterBuilder<T: LocationGenerator, F: FileNameGenerator> {
     props: WriterProperties,
     schema: SchemaRef,
@@ -381,7 +381,7 @@ impl ParquetWriter {
             // # TODO(#417)
             // - nan_value_counts
             // - distinct_counts
-            .key_metadata(metadata.footer_signing_key_metadata.unwrap_or_default())
+            .key_metadata(metadata.footer_signing_key_metadata)
             .split_offsets(
                 metadata
                     .row_groups
@@ -478,15 +478,18 @@ mod tests {
     use anyhow::Result;
     use arrow_array::types::Int64Type;
     use arrow_array::{
-        Array, ArrayRef, BooleanArray, Int32Array, Int64Array, ListArray, RecordBatch, StructArray,
+        Array, ArrayRef, BooleanArray, Decimal128Array, Int32Array, Int64Array, ListArray,
+        RecordBatch, StructArray,
     };
     use arrow_schema::{DataType, SchemaRef as ArrowSchemaRef};
     use arrow_select::concat::concat_batches;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use rust_decimal::Decimal;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::*;
+    use crate::arrow::schema_to_arrow_schema;
     use crate::io::FileIOBuilder;
     use crate::spec::{PrimitiveLiteral, Struct, *};
     use crate::writer::file_writer::location_generator::test::MockLocationGenerator;
@@ -538,6 +541,17 @@ mod tests {
                 NestedField::optional(14, "uuid", Type::Primitive(PrimitiveType::Uuid)).into(),
                 NestedField::optional(15, "fixed", Type::Primitive(PrimitiveType::Fixed(10)))
                     .into(),
+                // Parquet Statistics will use different representation for Decimal with precision 38 and scale 5,
+                // so we need to add a new field for it.
+                NestedField::optional(
+                    16,
+                    "decimal_38",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 38,
+                        scale: 5,
+                    }),
+                )
+                .into(),
             ])
             .build()
             .unwrap()
@@ -634,7 +648,7 @@ mod tests {
     async fn test_parquet_writer() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();
         let file_io = FileIOBuilder::new_fs_io().build().unwrap();
-        let loccation_gen =
+        let location_gen =
             MockLocationGenerator::new(temp_dir.path().to_str().unwrap().to_string());
         let file_name_gen =
             DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
@@ -658,7 +672,7 @@ mod tests {
             WriterProperties::builder().build(),
             Arc::new(to_write.schema().as_ref().try_into().unwrap()),
             file_io.clone(),
-            loccation_gen,
+            location_gen,
             file_name_gen,
         )
         .build()
@@ -1028,9 +1042,14 @@ mod tests {
             )
             .unwrap(),
         ) as ArrayRef;
+        let col16 = Arc::new(
+            arrow_array::Decimal128Array::from(vec![Some(1), Some(2), None, Some(100)])
+                .with_precision_and_scale(38, 5)
+                .unwrap(),
+        ) as ArrayRef;
         let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
             col0, col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11, col12, col13,
-            col14, col15,
+            col14, col15, col16,
         ])
         .unwrap();
 
@@ -1092,6 +1111,16 @@ mod tests {
                 ),
                 (14, Datum::uuid(Uuid::from_u128(0))),
                 (15, Datum::fixed(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])),
+                (
+                    16,
+                    Datum::new(
+                        PrimitiveType::Decimal {
+                            precision: 38,
+                            scale: 5
+                        },
+                        PrimitiveLiteral::Int128(1)
+                    )
+                ),
             ])
         );
         assert_eq!(
@@ -1125,11 +1154,262 @@ mod tests {
                     15,
                     Datum::fixed(vec![21, 22, 23, 24, 25, 26, 27, 28, 29, 30])
                 ),
+                (
+                    16,
+                    Datum::new(
+                        PrimitiveType::Decimal {
+                            precision: 38,
+                            scale: 5
+                        },
+                        PrimitiveLiteral::Int128(100)
+                    )
+                ),
             ])
         );
 
         // check the written file
         check_parquet_data_file(&file_io, &data_file, &to_write).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_decimal_bound() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let loccation_gen =
+            MockLocationGenerator::new(temp_dir.path().to_str().unwrap().to_string());
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+
+        // test 1.1 and 2.2
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![NestedField::optional(
+                    0,
+                    "decimal",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 28,
+                        scale: 10,
+                    }),
+                )
+                .into()])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let mut pw = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            schema.clone(),
+            file_io.clone(),
+            loccation_gen.clone(),
+            file_name_gen.clone(),
+        )
+        .build()
+        .await?;
+        let col0 = Arc::new(
+            Decimal128Array::from(vec![Some(22000000000), Some(11000000000)])
+                .with_data_type(DataType::Decimal128(28, 10)),
+        ) as ArrayRef;
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![col0]).unwrap();
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        assert_eq!(res.len(), 1);
+        let data_file = res
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(crate::spec::DataContentType::Data)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+        assert_eq!(
+            data_file.upper_bounds().get(&0),
+            Some(Datum::decimal_with_precision(Decimal::new(22000000000_i64, 10), 28).unwrap())
+                .as_ref()
+        );
+        assert_eq!(
+            data_file.lower_bounds().get(&0),
+            Some(Datum::decimal_with_precision(Decimal::new(11000000000_i64, 10), 28).unwrap())
+                .as_ref()
+        );
+
+        // test -1.1 and -2.2
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![NestedField::optional(
+                    0,
+                    "decimal",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 28,
+                        scale: 10,
+                    }),
+                )
+                .into()])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let mut pw = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            schema.clone(),
+            file_io.clone(),
+            loccation_gen.clone(),
+            file_name_gen.clone(),
+        )
+        .build()
+        .await?;
+        let col0 = Arc::new(
+            Decimal128Array::from(vec![Some(-22000000000), Some(-11000000000)])
+                .with_data_type(DataType::Decimal128(28, 10)),
+        ) as ArrayRef;
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![col0]).unwrap();
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        assert_eq!(res.len(), 1);
+        let data_file = res
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(crate::spec::DataContentType::Data)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+        assert_eq!(
+            data_file.upper_bounds().get(&0),
+            Some(Datum::decimal_with_precision(Decimal::new(-11000000000_i64, 10), 28).unwrap())
+                .as_ref()
+        );
+        assert_eq!(
+            data_file.lower_bounds().get(&0),
+            Some(Datum::decimal_with_precision(Decimal::new(-22000000000_i64, 10), 28).unwrap())
+                .as_ref()
+        );
+
+        // test max and min of rust_decimal
+        let decimal_max = Decimal::MAX;
+        let decimal_min = Decimal::MIN;
+        assert_eq!(decimal_max.scale(), decimal_min.scale());
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![NestedField::optional(
+                    0,
+                    "decimal",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 38,
+                        scale: decimal_max.scale(),
+                    }),
+                )
+                .into()])
+                .build()
+                .unwrap(),
+        );
+        let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let mut pw = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            schema,
+            file_io.clone(),
+            loccation_gen,
+            file_name_gen,
+        )
+        .build()
+        .await?;
+        let col0 = Arc::new(
+            Decimal128Array::from(vec![
+                Some(decimal_max.mantissa()),
+                Some(decimal_min.mantissa()),
+            ])
+            .with_data_type(DataType::Decimal128(38, 0)),
+        ) as ArrayRef;
+        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![col0]).unwrap();
+        pw.write(&to_write).await?;
+        let res = pw.close().await?;
+        assert_eq!(res.len(), 1);
+        let data_file = res
+            .into_iter()
+            .next()
+            .unwrap()
+            .content(crate::spec::DataContentType::Data)
+            .partition(Struct::empty())
+            .build()
+            .unwrap();
+        assert_eq!(
+            data_file.upper_bounds().get(&0),
+            Some(Datum::decimal(decimal_max).unwrap()).as_ref()
+        );
+        assert_eq!(
+            data_file.lower_bounds().get(&0),
+            Some(Datum::decimal(decimal_min).unwrap()).as_ref()
+        );
+
+        // test max and min for scale 38
+        // # TODO
+        // Readd this case after resolve https://github.com/apache/iceberg-rust/issues/669
+        // let schema = Arc::new(
+        //     Schema::builder()
+        //         .with_fields(vec![NestedField::optional(
+        //             0,
+        //             "decimal",
+        //             Type::Primitive(PrimitiveType::Decimal {
+        //                 precision: 38,
+        //                 scale: 0,
+        //             }),
+        //         )
+        //         .into()])
+        //         .build()
+        //         .unwrap(),
+        // );
+        // let arrow_schema: ArrowSchemaRef = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        // let mut pw = ParquetWriterBuilder::new(
+        //     WriterProperties::builder().build(),
+        //     schema,
+        //     file_io.clone(),
+        //     loccation_gen,
+        //     file_name_gen,
+        // )
+        // .build()
+        // .await?;
+        // let col0 = Arc::new(
+        //     Decimal128Array::from(vec![
+        //         Some(99999999999999999999999999999999999999_i128),
+        //         Some(-99999999999999999999999999999999999999_i128),
+        //     ])
+        //     .with_data_type(DataType::Decimal128(38, 0)),
+        // ) as ArrayRef;
+        // let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![col0]).unwrap();
+        // pw.write(&to_write).await?;
+        // let res = pw.close().await?;
+        // assert_eq!(res.len(), 1);
+        // let data_file = res
+        //     .into_iter()
+        //     .next()
+        //     .unwrap()
+        //     .content(crate::spec::DataContentType::Data)
+        //     .partition(Struct::empty())
+        //     .build()
+        //     .unwrap();
+        // assert_eq!(
+        //     data_file.upper_bounds().get(&0),
+        //     Some(Datum::new(
+        //         PrimitiveType::Decimal {
+        //             precision: 38,
+        //             scale: 0
+        //         },
+        //         PrimitiveLiteral::Int128(99999999999999999999999999999999999999_i128)
+        //     ))
+        //     .as_ref()
+        // );
+        // assert_eq!(
+        //     data_file.lower_bounds().get(&0),
+        //     Some(Datum::new(
+        //         PrimitiveType::Decimal {
+        //             precision: 38,
+        //             scale: 0
+        //         },
+        //         PrimitiveLiteral::Int128(-99999999999999999999999999999999999999_i128)
+        //     ))
+        //     .as_ref()
+        // );
 
         Ok(())
     }

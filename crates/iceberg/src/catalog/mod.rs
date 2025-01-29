@@ -29,9 +29,9 @@ use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
 use crate::spec::{
-    FormatVersion, Schema, SchemaId, Snapshot, SnapshotReference, SortOrder, TableMetadata,
-    TableMetadataBuilder, UnboundPartitionSpec, ViewFormatVersion, ViewRepresentations,
-    ViewVersion,
+    FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot, SnapshotReference,
+    SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder, UnboundPartitionSpec,
+    ViewFormatVersion, ViewRepresentations, ViewVersion,
 };
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
@@ -238,15 +238,15 @@ pub struct TableCreation {
     /// The name of the table.
     pub name: String,
     /// The location of the table.
-    #[builder(default, setter(strip_option))]
+    #[builder(default, setter(strip_option(fallback = location_opt)))]
     pub location: Option<String>,
     /// The schema of the table.
     pub schema: Schema,
     /// The partition spec of the table, could be None.
-    #[builder(default, setter(strip_option, into))]
+    #[builder(default, setter(strip_option(fallback = partition_spec_opt), into))]
     pub partition_spec: Option<UnboundPartitionSpec>,
     /// The sort order of the table.
-    #[builder(default, setter(strip_option))]
+    #[builder(default, setter(strip_option(fallback = sort_order_opt)))]
     pub sort_order: Option<SortOrder>,
     /// The properties of the table.
     #[builder(default)]
@@ -367,8 +367,6 @@ pub enum TableUpdate {
     AddSchema {
         /// The schema to add.
         schema: Schema,
-        /// The last column id of the table.
-        last_column_id: Option<i32>,
     },
     /// Set table's current schema
     #[serde(rename_all = "kebab-case")]
@@ -442,14 +440,79 @@ pub enum TableUpdate {
         /// Properties to remove
         removals: Vec<String>,
     },
+    /// Remove partition specs
+    #[serde(rename_all = "kebab-case")]
+    RemovePartitionSpecs {
+        /// Partition spec ids to remove.
+        spec_ids: Vec<i32>,
+    },
+    /// Set statistics for a snapshot
+    #[serde(with = "_serde_set_statistics")]
+    SetStatistics {
+        /// File containing the statistics
+        statistics: StatisticsFile,
+    },
+    /// Remove statistics for a snapshot
+    #[serde(rename_all = "kebab-case")]
+    RemoveStatistics {
+        /// Snapshot id to remove statistics for.
+        snapshot_id: i64,
+    },
+    /// Set partition statistics for a snapshot
+    #[serde(rename_all = "kebab-case")]
+    SetPartitionStatistics {
+        /// File containing the partition statistics
+        partition_statistics: PartitionStatisticsFile,
+    },
+    /// Remove partition statistics for a snapshot
+    #[serde(rename_all = "kebab-case")]
+    RemovePartitionStatistics {
+        /// Snapshot id to remove partition statistics for.
+        snapshot_id: i64,
+    },
 }
 
 impl TableUpdate {
     /// Applies the update to the table metadata builder.
     pub fn apply(self, builder: TableMetadataBuilder) -> Result<TableMetadataBuilder> {
         match self {
-            TableUpdate::AssignUuid { uuid } => builder.assign_uuid(uuid),
-            _ => unimplemented!(),
+            TableUpdate::AssignUuid { uuid } => Ok(builder.assign_uuid(uuid)),
+            TableUpdate::AddSchema { schema, .. } => Ok(builder.add_schema(schema)),
+            TableUpdate::SetCurrentSchema { schema_id } => builder.set_current_schema(schema_id),
+            TableUpdate::AddSpec { spec } => builder.add_partition_spec(spec),
+            TableUpdate::SetDefaultSpec { spec_id } => builder.set_default_partition_spec(spec_id),
+            TableUpdate::AddSortOrder { sort_order } => builder.add_sort_order(sort_order),
+            TableUpdate::SetDefaultSortOrder { sort_order_id } => {
+                builder.set_default_sort_order(sort_order_id)
+            }
+            TableUpdate::AddSnapshot { snapshot } => builder.add_snapshot(snapshot),
+            TableUpdate::SetSnapshotRef {
+                ref_name,
+                reference,
+            } => builder.set_ref(&ref_name, reference),
+            TableUpdate::RemoveSnapshots { snapshot_ids } => {
+                Ok(builder.remove_snapshots(&snapshot_ids))
+            }
+            TableUpdate::RemoveSnapshotRef { ref_name } => Ok(builder.remove_ref(&ref_name)),
+            TableUpdate::SetLocation { location } => Ok(builder.set_location(location)),
+            TableUpdate::SetProperties { updates } => builder.set_properties(updates),
+            TableUpdate::RemoveProperties { removals } => builder.remove_properties(&removals),
+            TableUpdate::UpgradeFormatVersion { format_version } => {
+                builder.upgrade_format_version(format_version)
+            }
+            TableUpdate::RemovePartitionSpecs { spec_ids } => {
+                builder.remove_partition_specs(&spec_ids)
+            }
+            TableUpdate::SetStatistics { statistics } => Ok(builder.set_statistics(statistics)),
+            TableUpdate::RemoveStatistics { snapshot_id } => {
+                Ok(builder.remove_statistics(snapshot_id))
+            }
+            TableUpdate::SetPartitionStatistics {
+                partition_statistics,
+            } => Ok(builder.set_partition_statistics(partition_statistics)),
+            TableUpdate::RemovePartitionStatistics { snapshot_id } => {
+                Ok(builder.remove_partition_statistics(snapshot_id))
+            }
         }
     }
 }
@@ -730,6 +793,53 @@ pub enum ViewUpdate {
     },
 }
 
+mod _serde_set_statistics {
+    // The rest spec requires an additional field `snapshot-id`
+    // that is redundant with the `snapshot_id` field in the statistics file.
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::*;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct SetStatistics {
+        snapshot_id: Option<i64>,
+        statistics: StatisticsFile,
+    }
+
+    pub fn serialize<S>(
+        value: &StatisticsFile,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SetStatistics {
+            snapshot_id: Some(value.snapshot_id),
+            statistics: value.clone(),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<StatisticsFile, D::Error>
+    where D: Deserializer<'de> {
+        let SetStatistics {
+            snapshot_id,
+            statistics,
+        } = SetStatistics::deserialize(deserializer)?;
+        if let Some(snapshot_id) = snapshot_id {
+            if snapshot_id != statistics.snapshot_id {
+                return Err(serde::de::Error::custom(format!(
+                    "Snapshot id to set {snapshot_id} does not match the statistics file snapshot id {}",
+                    statistics.snapshot_id
+                )));
+            }
+        }
+
+        Ok(statistics)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -741,11 +851,11 @@ mod tests {
 
     use super::ViewUpdate;
     use crate::spec::{
-        FormatVersion, NestedField, NullOrder, Operation, PrimitiveType, Schema, Snapshot,
-        SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder,
-        SqlViewRepresentation, Summary, TableMetadata, TableMetadataBuilder, Transform, Type,
-        UnboundPartitionSpec, ViewFormatVersion, ViewRepresentation, ViewRepresentations,
-        ViewVersion,
+        BlobMetadata, FormatVersion, NestedField, NullOrder, Operation, PartitionStatisticsFile,
+        PrimitiveType, Schema, Snapshot, SnapshotReference, SnapshotRetention, SortDirection,
+        SortField, SortOrder, SqlViewRepresentation, StatisticsFile, Summary, TableMetadata,
+        TableMetadataBuilder, Transform, Type, UnboundPartitionSpec, ViewFormatVersion,
+        ViewRepresentation, ViewRepresentations, ViewVersion, MAIN_BRANCH,
     };
     use crate::{NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate};
 
@@ -799,9 +909,9 @@ mod tests {
         TableMetadataBuilder::from_table_creation(tbl_creation)
             .unwrap()
             .assign_uuid(uuid::Uuid::nil())
-            .unwrap()
             .build()
             .unwrap()
+            .metadata
     }
 
     #[test]
@@ -851,7 +961,7 @@ mod tests {
         {
             "snapshot-id": 3051729675574597004,
             "sequence-number": 10,
-            "timestamp-ms": 1515100955770,
+            "timestamp-ms": 9992191116217,
             "summary": {
                 "operation": "append"
             },
@@ -861,8 +971,28 @@ mod tests {
         "#;
 
         let snapshot = serde_json::from_str::<Snapshot>(record).unwrap();
-        let mut metadata = metadata;
-        metadata.append_snapshot(snapshot);
+        let builder = metadata.into_builder(None);
+        let builder = TableUpdate::AddSnapshot {
+            snapshot: snapshot.clone(),
+        }
+        .apply(builder)
+        .unwrap();
+        let metadata = TableUpdate::SetSnapshotRef {
+            ref_name: MAIN_BRANCH.to_string(),
+            reference: SnapshotReference {
+                snapshot_id: snapshot.snapshot_id(),
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(10),
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            },
+        }
+        .apply(builder)
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
 
         // Ref exists and should matches
         let requirement = TableRequirement::RefSnapshotIdMatch {
@@ -912,14 +1042,13 @@ mod tests {
     #[test]
     fn test_check_last_assigned_partition_id() {
         let metadata = metadata();
-
         let requirement = TableRequirement::LastAssignedPartitionIdMatch {
-            last_assigned_partition_id: 1,
+            last_assigned_partition_id: 0,
         };
         assert!(requirement.check(Some(&metadata)).is_err());
 
         let requirement = TableRequirement::LastAssignedPartitionIdMatch {
-            last_assigned_partition_id: 0,
+            last_assigned_partition_id: 999,
         };
         assert!(requirement.check(Some(&metadata)).is_ok());
     }
@@ -1175,7 +1304,6 @@ mod tests {
         "#,
             TableUpdate::AddSchema {
                 schema: test_schema.clone(),
-                last_column_id: Some(3),
             },
         );
 
@@ -1214,7 +1342,6 @@ mod tests {
         "#,
             TableUpdate::AddSchema {
                 schema: test_schema.clone(),
-                last_column_id: None,
             },
         );
     }
@@ -1378,7 +1505,7 @@ mod tests {
                 .with_schema_id(1)
                 .with_summary(Summary {
                     operation: Operation::Append,
-                    other: HashMap::default(),
+                    additional_properties: HashMap::default(),
                 })
                 .build(),
         };
@@ -1412,7 +1539,7 @@ mod tests {
                 .with_manifest_list("s3://a/b/2.avro")
                 .with_summary(Summary {
                     operation: Operation::Append,
-                    other: HashMap::default(),
+                    additional_properties: HashMap::default(),
                 })
                 .build(),
         };
@@ -1578,8 +1705,12 @@ mod tests {
         let table_metadata = TableMetadataBuilder::from_table_creation(table_creation)
             .unwrap()
             .build()
-            .unwrap();
-        let table_metadata_builder = TableMetadataBuilder::new(table_metadata);
+            .unwrap()
+            .metadata;
+        let table_metadata_builder = TableMetadataBuilder::new_from_metadata(
+            table_metadata,
+            Some("s3://db/table/metadata/metadata1.gz.json".to_string()),
+        );
 
         let uuid = uuid::Uuid::new_v4();
         let update = TableUpdate::AssignUuid { uuid };
@@ -1587,7 +1718,8 @@ mod tests {
             .apply(table_metadata_builder)
             .unwrap()
             .build()
-            .unwrap();
+            .unwrap()
+            .metadata;
         assert_eq!(updated_metadata.uuid(), uuid);
     }
 
@@ -1785,5 +1917,122 @@ mod tests {
         "#,
             ViewUpdate::SetCurrentViewVersion { view_version_id: 1 },
         );
+    }
+
+    #[test]
+    fn test_remove_partition_specs_update() {
+        test_serde_json(
+            r#"
+{
+    "action": "remove-partition-specs",
+    "spec-ids": [1, 2]
+}        
+        "#,
+            TableUpdate::RemovePartitionSpecs {
+                spec_ids: vec![1, 2],
+            },
+        );
+    }
+
+    #[test]
+    fn test_set_statistics_file() {
+        test_serde_json(
+            r#"
+        {
+                "action": "set-statistics",
+                "snapshot-id": 1940541653261589030,
+                "statistics": {
+                        "snapshot-id": 1940541653261589030,
+                        "statistics-path": "s3://bucket/warehouse/stats.puffin",
+                        "file-size-in-bytes": 124,
+                        "file-footer-size-in-bytes": 27,
+                        "blob-metadata": [
+                                {
+                                        "type": "boring-type",
+                                        "snapshot-id": 1940541653261589030,
+                                        "sequence-number": 2,
+                                        "fields": [
+                                                1
+                                        ],
+                                        "properties": {
+                                                "prop-key": "prop-value"
+                                        }
+                                }
+                        ]
+                }
+        } 
+        "#,
+            TableUpdate::SetStatistics {
+                statistics: StatisticsFile {
+                    snapshot_id: 1940541653261589030,
+                    statistics_path: "s3://bucket/warehouse/stats.puffin".to_string(),
+                    file_size_in_bytes: 124,
+                    file_footer_size_in_bytes: 27,
+                    key_metadata: None,
+                    blob_metadata: vec![BlobMetadata {
+                        r#type: "boring-type".to_string(),
+                        snapshot_id: 1940541653261589030,
+                        sequence_number: 2,
+                        fields: vec![1],
+                        properties: vec![("prop-key".to_string(), "prop-value".to_string())]
+                            .into_iter()
+                            .collect(),
+                    }],
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn test_remove_statistics_file() {
+        test_serde_json(
+            r#"
+        {
+                "action": "remove-statistics",
+                "snapshot-id": 1940541653261589030
+        } 
+        "#,
+            TableUpdate::RemoveStatistics {
+                snapshot_id: 1940541653261589030,
+            },
+        );
+    }
+
+    #[test]
+    fn test_set_partition_statistics_file() {
+        test_serde_json(
+            r#"
+            {
+                "action": "set-partition-statistics",
+                "partition-statistics": {
+                    "snapshot-id": 1940541653261589030,
+                    "statistics-path": "s3://bucket/warehouse/stats1.parquet",
+                    "file-size-in-bytes": 43
+                }
+            }
+            "#,
+            TableUpdate::SetPartitionStatistics {
+                partition_statistics: PartitionStatisticsFile {
+                    snapshot_id: 1940541653261589030,
+                    statistics_path: "s3://bucket/warehouse/stats1.parquet".to_string(),
+                    file_size_in_bytes: 43,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn test_remove_partition_statistics_file() {
+        test_serde_json(
+            r#"
+            {
+                "action": "remove-partition-statistics",
+                "snapshot-id": 1940541653261589030
+            }
+            "#,
+            TableUpdate::RemovePartitionStatistics {
+                snapshot_id: 1940541653261589030,
+            },
+        )
     }
 }
