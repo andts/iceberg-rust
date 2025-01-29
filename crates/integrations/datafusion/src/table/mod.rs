@@ -38,7 +38,7 @@ use crate::physical_plan::scan::IcebergTableScan;
 #[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
     /// A table in the catalog.
-    table: Table,
+    pub table: Table,
     /// Table snapshot id that will be queried via this provider.
     snapshot_id: Option<i64>,
     /// A reference-counted arrow `Schema`.
@@ -56,7 +56,7 @@ impl IcebergTableProvider {
     /// Asynchronously tries to construct a new [`IcebergTableProvider`]
     /// using the given client and table name to fetch an actual [`Table`]
     /// in the provided namespace.
-    pub(crate) async fn try_new(
+    pub async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         name: impl Into<String>,
