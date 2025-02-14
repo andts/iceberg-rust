@@ -38,7 +38,7 @@ use crate::physical_plan::scan::IcebergTableScan;
 #[derive(Debug, Clone)]
 pub struct IcebergTableProvider {
     /// A table in the catalog.
-    pub table: Table,
+    table: Table,
     /// Table snapshot id that will be queried via this provider.
     snapshot_id: Option<i64>,
     /// A reference-counted arrow `Schema`.
@@ -106,6 +106,10 @@ impl IcebergTableProvider {
             snapshot_id: Some(snapshot_id),
             schema,
         })
+    }
+    
+    pub fn get_iceberg_table(&self) -> &Table {
+        &self.table
     }
 }
 
