@@ -242,6 +242,10 @@
 <a href="#242" id="242">242</a>
 <a href="#243" id="243">243</a>
 <a href="#244" id="244">244</a>
+<a href="#245" id="245">245</a>
+<a href="#246" id="246">246</a>
+<a href="#247" id="247">247</a>
+<a href="#248" id="248">248</a>
 </pre></div><pre class="rust"><code><span class="comment">// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -282,7 +286,7 @@
 </span><span class="attr">#[derive(Debug, Clone)]
 </span><span class="kw">pub struct </span>IcebergTableProvider {
     <span class="doccomment">/// A table in the catalog.
-    </span><span class="kw">pub </span>table: Table,
+    </span>table: Table,
     <span class="doccomment">/// Table snapshot id that will be queried via this provider.
     </span>snapshot_id: <span class="prelude-ty">Option</span>&lt;i64&gt;,
     <span class="doccomment">/// A reference-counted arrow `Schema`.
@@ -350,6 +354,10 @@
             snapshot_id: <span class="prelude-val">Some</span>(snapshot_id),
             schema,
         })
+    }
+    
+    <span class="kw">pub fn </span>get_iceberg_table(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>Table {
+        <span class="kw-2">&amp;</span><span class="self">self</span>.table
     }
 }
 
